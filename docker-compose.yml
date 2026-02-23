@@ -1,0 +1,15 @@
+services:
+  trading-bot:
+    build: .
+    container_name: trading_bot_app
+    restart: unless-stopped
+    volumes:
+      - .:/app
+      - /app/refactored_bot.log
+      - /app/session_stats.json
+      - /app/session_stats_v2.json
+    env_file:
+      - .env
+    environment:
+      - TRADING_ENV=SANDBOX
+      - PYTHONUNBUFFERED=1

@@ -1,0 +1,7 @@
+python-binance
+pandas
+numpy
+ta
+python-dotenv
+openai
+httpx
