@@ -77,6 +77,12 @@ class PositionManager:
                 
                 with lock:
                     if p.symbol not in active_symbols:
+                        # Skip dust positions (< 1.0 USDT notional)
+                        notional = p.entry_price * p.quantity
+                        if notional < 1.0:
+                            log.debug(f"🧹 [AUDITOR] Skipping dust position in {p.symbol} (${notional:.2f})")
+                            continue
+
                         active_symbols.add(p.symbol)
                         # Default tp/sl if orphaned
                         p.sl = p.entry_price * (0.985 if p.side == OrderSide.LONG else 1.015)
@@ -116,6 +122,8 @@ class TradingBotApp:
         self._cooldowns: Dict[str, float] = {}  # symbol -> timestamp of last close
         self.COOLDOWN_SECONDS = 300  # 5 min cooldown after any close
         self._last_daily_email: Optional[str] = None  # date string of last daily analysis email
+        self.PORTFOLIO_USDT = 100.0  # Dedicated capital for Flash Growth
+        self.PERCENT_PER_TRADE = 0.30  # 30% of portfolio per trade
         # Email notifier — instantiated once, all calls fail silently
         try:
             self.notifier = EmailNotifier()
@@ -138,8 +146,13 @@ class TradingBotApp:
                         log.warning(f"⚠️ [IA {pos.symbol}] Emergency close via AI.")
                         self.bulk_advice.pop(pos.symbol, None)  # clear advice so it doesn't loop
                         break
+                    elif advice == "MOVE_SL_TO_BE" and not pos.tp1_hit:
+                        pos.sl = pos.entry_price
+                        self.bulk_advice.pop(pos.symbol, None)
+                        log.info(f"🛡️ [IA {pos.symbol}] SL moved to Break-Even by AI.")
                     elif advice == "REDUCE_RISK" and not pos.tp1_hit:
                         pos.sl = pos.entry_price
+                        self.bulk_advice.pop(pos.symbol, None)
                         log.info(f"🛡️ [IA {pos.symbol}] Risk reduced to Break-Even.")
 
                 # TP/SL check
@@ -232,10 +245,11 @@ class TradingBotApp:
         try:
             btc_df = self.market.get_candles("BTCUSDT", "4h", limit=6)
             btc_change = (btc_df["close"].iloc[-2] - btc_df["close"].iloc[-3]) / btc_df["close"].iloc[-3] * 100
-            if abs(btc_change) >= 1.5:
+            self._btc_change = round(btc_change, 2)  # Cache for AI bulk context
+            if abs(btc_change) >= 0.8:
                 reasons_ok.append(f"BTC 4h: {btc_change:+.2f}% ✅")
             else:
-                reasons_bad.append(f"BTC 4h plano: {btc_change:+.2f}% (necesita ±1.5%)")
+                reasons_bad.append(f"BTC 4h plano: {btc_change:+.2f}% (necesita ±0.8%)")
         except Exception as e:
             log.debug(f"BTC check skipped: {e}")
 
@@ -247,6 +261,7 @@ class TradingBotApp:
                 adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
                 adx_values.append(adx.iloc[-2])
             avg_adx = sum(adx_values) / len(adx_values) if adx_values else 0
+            self._avg_adx = round(avg_adx, 1)  # Cache for AI bulk context
             if avg_adx >= 20:
                 reasons_ok.append(f"ADX promedio: {avg_adx:.1f} ✅")
             else:
@@ -365,24 +380,45 @@ class TradingBotApp:
                             res = self.executor.scan_for_signal(symbol, self.strategies, self.session_stats, self.active_symbols, self.lock)
                             if res:
                                 signal, multiplier = res
-                                price = self.market.get_price(symbol)
-                                qty = self.trading.get_quantity(symbol, self.risk.usdt_per_trade * multiplier, price, self.leverage)
                                 
-                                side_str = "BUY" if signal.side == OrderSide.LONG else "SELL"
-                                if self.trading.place_order(symbol, side_str, qty):
-                                    pos = Position(symbol, signal.side, price, qty, signal.tp_levels, signal.sl, signal.strategy_name)
-                                    with self.lock: self.active_symbols.add(symbol)
-                                    threading.Thread(target=self._monitor_trade, args=(pos,), daemon=True).start()
-                                    # Email: trade opened
-                                    if self.notifier:
-                                        tp_val = signal.tp_levels[0] if signal.tp_levels else 0
-                                        threading.Thread(
-                                            target=self.notifier.notify_trade_opened,
-                                            args=(symbol, "LONG" if signal.side == OrderSide.LONG else "SHORT",
-                                                  price, qty, signal.sl, tp_val, signal.strategy_name),
-                                            daemon=True
-                                        ).start()
-                                    time.sleep(5)
+                                # AI Confidence Check for Flash Growth
+                                approve, confidence, reason, quality = self.ai.analyze_setup(signal.strategy_name, symbol, signal)
+                                
+                                if approve:
+                                    # Aggressive Leverage Scaling (15x base, 20x for high-confidence)
+                                    final_leverage = 15
+                                    if int(confidence) >= 90:
+                                        final_leverage = 20
+                                        log.info(f"💎 [PREMIUM SIGNAL] {symbol} | Confidence: {confidence}% | Upscaling Leverage to {final_leverage}x")
+                                    
+                                    # Ensure exchange leverage matches
+                                    self.trading.change_leverage(symbol, final_leverage)
+                                    
+                                    # Dynamic Quantity Calculation (30% of 100 USDT balance + session pnl)
+                                    virtual_balance = self.PORTFOLIO_USDT + (self.session_stats.total_gain - self.session_stats.total_loss)
+                                    usdt_to_invest = max(virtual_balance * self.PERCENT_PER_TRADE, self.MIN_NOTIONAL)
+                                    
+                                    price = self.market.get_price(symbol)
+                                    qty = self.trading.get_quantity(symbol, usdt_to_invest, price, final_leverage)
+                                    
+                                    side_str = "BUY" if signal.side == OrderSide.LONG else "SELL"
+                                    order = self.trading.place_order(symbol, side_str, qty)
+                                    if order:
+                                        pos = Position(symbol, signal.side, price, qty, signal.tp_levels, signal.sl, signal.strategy_name)
+                                        with self.lock: self.active_symbols.add(symbol)
+                                        threading.Thread(target=self._monitor_trade, args=(pos,), daemon=True).start()
+                                        
+                                        # Email: trade opened
+                                        if self.notifier:
+                                            tp_val = signal.tp_levels[0] if signal.tp_levels else 0
+                                            threading.Thread(
+                                                target=self.notifier.notify_trade_opened,
+                                                args=(symbol, signal.side.value, price, qty, signal.sl, tp_val, signal.strategy_name),
+                                                daemon=True
+                                            ).start()
+                                            
+                                        # Small delay to avoid rapid-fire orders on multiple symbols
+                                        time.sleep(5)
 
 
                 
@@ -401,28 +437,67 @@ class TradingBotApp:
                         wr = (stats.total_wins / total_trades * 100) if total_trades > 0 else 0
                         with self.lock:
                             active = list(self.active_symbols)
-                        threading.Thread(
-                            target=self.notifier.notify_pnl_summary,
-                            args=(stats.total_wins, stats.total_losses, total, wr,
-                                  stats.total_gain, -stats.total_loss, active),
-                            daemon=True
-                        ).start()
 
-                        # This should ideally be fetched from the actual exchange positions
-                        # For simplicity, we use our tracked positions or fetch again
-                        pos_info = [] # Fetch real data from trading service
+                        # Enrich position data with technical indicators for smarter AI decisions
+                        import ta as ta_lib
+                        pos_info = []
                         positions = self.trading.get_active_positions()
                         for p in positions:
                             if p.symbol in subjects:
                                 curr = self.market.get_price(p.symbol)
                                 pnl = ((curr - p.entry_price)/p.entry_price*100) if p.side == OrderSide.LONG else ((p.entry_price - curr)/p.entry_price*100)
-                                pos_info.append({'symbol': p.symbol, 'side': p.side.value, 'entry': p.entry_price, 'price': curr, 'pnl': pnl})
+                                entry = {'symbol': p.symbol, 'side': p.side.value, 'entry': p.entry_price, 'price': curr, 'pnl': pnl}
+                                # Compute ADX and RSI from 15m candles
+                                try:
+                                    df = self.market.get_candles(p.symbol, "15m", limit=30)
+                                    adx = ta_lib.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx().iloc[-2]
+                                    rsi = ta_lib.momentum.RSIIndicator(df["close"], window=14).rsi().iloc[-2]
+                                    ema21 = ta_lib.trend.EMAIndicator(df["close"], window=21).ema_indicator().iloc[-2]
+                                    trend = "UP" if curr > ema21 else "DOWN"
+                                    entry.update({'adx': adx, 'rsi': rsi, 'trend': trend})
+                                except Exception:
+                                    pass  # Proceed without technicals if fetching fails
+                                pos_info.append(entry)
                         
+                        # Build market context for AI
+                        market_ctx = None
+                        try:
+                            market_ctx = {
+                                'btc_momentum': f"{getattr(self, '_btc_change', 'N/A')}",
+                                'avg_adx': f"{getattr(self, '_avg_adx', 'N/A')}",
+                                'market_ok': getattr(self, '_market_ok', True)
+                            }
+                        except Exception:
+                            pass
+
+                        advice = {}
                         if pos_info:
-                            advice = self.ai.analyze_bulk_positions(pos_info)
+                            advice = self.ai.analyze_bulk_positions(pos_info, market_context=market_ctx)
                             with self.bulk_lock:
                                 self.bulk_advice.update(advice)
                             log.info(f"✅ [IA BULK] Recommendations: {advice}")
+
+                            # Email: AI decision (only if actionable)
+                            if self.notifier and advice:
+                                threading.Thread(
+                                    target=self.notifier.notify_ai_bulk_decision,
+                                    args=(advice, pos_info, market_ctx),
+                                    daemon=True
+                                ).start()
+
+                        # Email: P&L summary (now includes market context and AI recs)
+                        last_advice = getattr(self, '_last_bulk_advice', None)
+                        if advice:
+                            self._last_bulk_advice = advice
+                            last_advice = advice
+                        threading.Thread(
+                            target=self.notifier.notify_pnl_summary,
+                            args=(stats.total_wins, stats.total_losses, total, wr,
+                                  stats.total_gain, -stats.total_loss, active),
+                            kwargs={'market_context': market_ctx,
+                                    'ai_recommendations': last_advice},
+                            daemon=True
+                        ).start()
 
                 # Refresh symbols every 120 iterations (~1h with 30s loops)
                 if iteration % 120 == 0 and iteration > 0:

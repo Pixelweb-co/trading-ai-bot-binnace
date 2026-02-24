@@ -61,7 +61,7 @@ class IAIService(ABC):
         pass
 
     @abstractmethod
-    def analyze_bulk_positions(self, positions_data: List[Dict[str, Any]]) -> Dict[str, str]:
+    def analyze_bulk_positions(self, positions_data: List[Dict[str, Any]], market_context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
         """Returns map of symbol to action (CLOSE_NOW, REDUCE_RISK, etc)"""
         pass
 

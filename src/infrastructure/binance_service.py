@@ -26,10 +26,21 @@ class BinanceService(IMarketDataService, ITradingService):
         except Exception as e:
             log.warning(f"⚠️ Failed to sync time: {e}")
 
+    def _safe_call(self, func, *args, **kwargs):
+        """Wrapper to catch timestamp errors and resync automatically."""
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if "code=-1021" in str(e):
+                log.warning("🔄 [BINANCE] Timestamp error detected. Resyncing time and retrying...")
+                self._sync_time()
+                return func(*args, **kwargs)
+            raise e
+
     # --- IMarketDataService ---
 
     def get_candles(self, symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
-        raw = self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        raw = self._safe_call(self.client.futures_klines, symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(raw, columns=[
             "open_time","open","high","low","close","volume",
             "close_time","quote_vol","trades","taker_base","taker_quote","ignore"
@@ -71,7 +82,7 @@ class BinanceService(IMarketDataService, ITradingService):
         scored by scalping opportunity: volume + volatility + price momentum.
         """
         try:
-            tickers = self.client.futures_ticker()
+            tickers = self._safe_call(self.client.futures_ticker)
         except Exception as e:
             log.error(f"❌ Error fetching tickers: {e}")
             return []
@@ -143,7 +154,7 @@ class BinanceService(IMarketDataService, ITradingService):
 
     def place_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
         try:
-            order = self.client.futures_create_order(
+            order = self._safe_call(self.client.futures_create_order,
                 symbol=symbol, 
                 side=side, 
                 type=Client.FUTURE_ORDER_TYPE_MARKET, 
@@ -156,11 +167,11 @@ class BinanceService(IMarketDataService, ITradingService):
             return None
 
     def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        info = self.client.futures_exchange_info()
+        info = self._safe_call(self.client.futures_exchange_info)
         return next(i for i in info["symbols"] if i["symbol"] == symbol)
 
     def get_active_positions(self) -> List[Position]:
-        positions = self.client.futures_position_information(recvWindow=10000)
+        positions = self._safe_call(self.client.futures_position_information, recvWindow=10000)
         active = []
         for p in positions:
             qty = float(p['positionAmt'])
@@ -207,7 +218,7 @@ class BinanceService(IMarketDataService, ITradingService):
 
     def change_leverage(self, symbol: str, leverage: int):
         try:
-            self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            self._safe_call(self.client.futures_change_leverage, symbol=symbol, leverage=leverage)
         except Exception as e:
             log.warning(f"Failed to change leverage for {symbol}: {e}")
 

@@ -169,20 +169,48 @@ Responde estrictamente en formato JSON:
             log.error(f"Error AI analyzing Cascade setup: {e}")
             return True, "50", "Error en IA", "B"
 
-    def analyze_bulk_positions(self, positions_data: List[Dict[str, Any]]) -> Dict[str, str]:
+    def analyze_bulk_positions(self, positions_data: List[Dict[str, Any]], market_context: Dict[str, Any] = None) -> Dict[str, str]:
         if not self.client or not positions_data: return {}
 
         positions_str = ""
         for p in positions_data:
-            positions_str += f"- {p['symbol']} ({p['side']}): Entry {p['entry']}, Price {p['price']}, PNL {p['pnl']:.2f}%\n"
+            line = f"- {p['symbol']} ({p['side']}): Entry {p['entry']}, Price {p['price']}, PNL {p['pnl']:.2f}%"
+            # Enrich with technical indicators if available
+            if 'adx' in p:
+                line += f", ADX={p['adx']:.1f}"
+            if 'rsi' in p:
+                line += f", RSI={p['rsi']:.1f}"
+            if 'trend' in p:
+                line += f", Trend={p['trend']}"
+            positions_str += line + "\n"
+
+        # Add market-level context
+        market_str = ""
+        if market_context:
+            btc_mom = market_context.get('btc_momentum', 'N/A')
+            avg_adx = market_context.get('avg_adx', 'N/A')
+            market_ok = market_context.get('market_ok', True)
+            market_str = f"""
+Contexto de Mercado:
+- BTC 4h Momentum: {btc_mom}%
+- ADX Promedio del Mercado: {avg_adx}
+- Condiciones Favorables: {'Sí' if market_ok else 'No'}
+"""
 
         prompt = f"""
-Actúa como un gestor de riesgos senior para una cartera de cripto-scalping.
-Analiza estas posiciones abiertas:
+Actúa como un gestor de riesgos senior para una cartera de cripto-scalping con capital limitado ($100 USDT).
+En un mercado difícil, prioriza ASEGURAR ganancias pequeñas para reinvertir.
+{market_str}
+Posiciones abiertas:
 {positions_str}
 
-Para cada símbolo, decide: HOLD, REDUCE_RISK o CLOSE_NOW.
-Criterios: cierra si PnL < -4% o si está estancado. Mueve SL a BE si PnL > 0.5%.
+Para cada símbolo, decide: HOLD, REDUCE_RISK, MOVE_SL_TO_BE, o CLOSE_NOW.
+Criterios avanzados:
+- CLOSE_NOW si: PnL < -4%, O si ADX < 25 con PnL > 0 (tendencia muriéndose, asegurar ganancia), 
+  O si RSI > 75 (LONG agotado) o RSI < 25 (SHORT agotado)
+- MOVE_SL_TO_BE si: PnL > 0.3% y ADX > 25 (tendencia aún viva)
+- REDUCE_RISK si: PnL entre -2% y 0% con ADX cayendo
+- HOLD solo si: tendencia fuerte (ADX > 30) y PnL razonable
 Responde en JSON: {{ "SYMBOL": "ACTION" }}
 """
         try:

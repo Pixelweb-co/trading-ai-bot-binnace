@@ -124,12 +124,42 @@ class EmailNotifier:
 
     def notify_pnl_summary(self, wins: int, losses: int, total_pnl: float,
                             win_rate: float, best: float, worst: float,
-                            active_positions: list):
+                            active_positions: list, market_context: dict = None,
+                            ai_recommendations: dict = None):
         ts = datetime.now().strftime("%d/%m/%Y %H:%M")
         pnl_color = "#00e676" if total_pnl >= 0 else "#ff5252"
         positions_html = "".join(
             f"<li>{p}</li>" for p in active_positions
         ) if active_positions else "<li>Ninguna</li>"
+
+        # Market context section
+        market_html = ""
+        if market_context:
+            btc = market_context.get('btc_momentum', 'N/A')
+            adx = market_context.get('avg_adx', 'N/A')
+            mkt_ok = market_context.get('market_ok', True)
+            gate_color = '#00e676' if mkt_ok else '#ff5252'
+            gate_text = '✅ OK' if mkt_ok else '🚫 DESFAV.'
+            market_html = f"""
+            <h3 style="color:#ffab40">🌍 Contexto de Mercado</h3>
+            <table style="border-collapse:collapse;width:100%">
+              <tr><td style="color:#aaa;padding:4px">BTC 4h:</td><td>{btc}%</td></tr>
+              <tr><td style="color:#aaa;padding:4px">ADX Promedio:</td><td>{adx}</td></tr>
+              <tr><td style="color:#aaa;padding:4px">Estado:</td><td style="color:{gate_color}">{gate_text}</td></tr>
+            </table>"""
+
+        # AI recommendations section
+        ai_html = ""
+        if ai_recommendations:
+            action_colors = {'CLOSE_NOW': '#ff5252', 'REDUCE_RISK': '#ffab40', 'MOVE_SL_TO_BE': '#00e5ff', 'HOLD': '#aaa'}
+            rows = ""
+            for sym, action in ai_recommendations.items():
+                color = action_colors.get(action, '#e0e0e0')
+                rows += f'<tr><td style="padding:4px">{sym}</td><td style="color:{color};font-weight:bold">{action}</td></tr>'
+            ai_html = f"""
+            <h3 style="color:#00e5ff">🤖 Decisión IA (Smart Harvest)</h3>
+            <table style="border-collapse:collapse;width:100%">{rows}</table>"""
+
         body = f"""
         <html><body style="font-family:Arial;background:#0d0d0d;color:#e0e0e0;padding:20px">
         <h2 style="color:#00e5ff">📊 Resumen de Ganancias y Pérdidas</h2>
@@ -145,8 +175,74 @@ class EmailNotifier:
         </table>
         <h3 style="color:#00e5ff">Posiciones activas:</h3>
         <ul>{positions_html}</ul>
+        {market_html}
+        {ai_html}
         </body></html>"""
         self._send(f"📊 Resumen P&L: {total_pnl:+.2f} USDT | WR: {win_rate:.0f}%", body)
+
+    def notify_ai_bulk_decision(self, recommendations: dict, positions_data: list,
+                                  market_context: dict = None):
+        """Send email when AI makes actionable decisions with full technical context."""
+        if not recommendations:
+            return
+        # Only send if there's something actionable (not just HOLD)
+        actionable = {s: a for s, a in recommendations.items() if a != 'HOLD'}
+        if not actionable:
+            return
+
+        ts = datetime.now().strftime("%d/%m/%Y %H:%M")
+        action_colors = {'CLOSE_NOW': '#ff5252', 'REDUCE_RISK': '#ffab40', 'MOVE_SL_TO_BE': '#00e5ff', 'HOLD': '#aaa'}
+        action_icons = {'CLOSE_NOW': '🔴', 'REDUCE_RISK': '🟡', 'MOVE_SL_TO_BE': '🛡️', 'HOLD': '⏸️'}
+
+        rows = ""
+        for p in positions_data:
+            sym = p['symbol']
+            action = recommendations.get(sym, 'HOLD')
+            color = action_colors.get(action, '#e0e0e0')
+            icon = action_icons.get(action, '')
+            adx = f"{p.get('adx', 0):.1f}" if 'adx' in p else 'N/A'
+            rsi = f"{p.get('rsi', 0):.1f}" if 'rsi' in p else 'N/A'
+            trend = p.get('trend', 'N/A')
+            rows += f"""
+            <tr style="border-bottom:1px solid #333">
+              <td style="padding:8px;font-weight:bold">{sym}</td>
+              <td style="padding:8px">{p['side']}</td>
+              <td style="padding:8px">{p['pnl']:+.2f}%</td>
+              <td style="padding:8px">{adx}</td>
+              <td style="padding:8px">{rsi}</td>
+              <td style="padding:8px">{trend}</td>
+              <td style="padding:8px;color:{color};font-weight:bold">{icon} {action}</td>
+            </tr>"""
+
+        market_html = ""
+        if market_context:
+            market_html = f"""
+            <p style="color:#aaa;margin-top:12px">
+              BTC 4h: {market_context.get('btc_momentum', 'N/A')}% |
+              ADX Mercado: {market_context.get('avg_adx', 'N/A')} |
+              Estado: {'✅ OK' if market_context.get('market_ok', True) else '🚫 DESFAV.'}
+            </p>"""
+
+        body = f"""
+        <html><body style="font-family:Arial;background:#0d0d0d;color:#e0e0e0;padding:20px">
+        <h2 style="color:#ffab40">🤖 Decisión IA — Smart Harvest</h2>
+        <p style="color:#aaa">{ts}</p>
+        {market_html}
+        <table style="border-collapse:collapse;width:100%;margin-top:12px">
+          <tr style="border-bottom:2px solid #555">
+            <th style="padding:8px;text-align:left;color:#aaa">Símbolo</th>
+            <th style="padding:8px;text-align:left;color:#aaa">Lado</th>
+            <th style="padding:8px;text-align:left;color:#aaa">PnL</th>
+            <th style="padding:8px;text-align:left;color:#aaa">ADX</th>
+            <th style="padding:8px;text-align:left;color:#aaa">RSI</th>
+            <th style="padding:8px;text-align:left;color:#aaa">Tendencia</th>
+            <th style="padding:8px;text-align:left;color:#aaa">Acción</th>
+          </tr>
+          {rows}
+        </table>
+        </body></html>"""
+        actions_str = ", ".join(f"{s}:{a}" for s, a in actionable.items())
+        self._send(f"🤖 IA Decisión: {actions_str}", body)
 
     def notify_market_analysis(self, btc_change_4h: float, avg_adx: float,
                                  funding: float, market_ok: bool, reason: str,
